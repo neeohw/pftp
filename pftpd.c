@@ -3,38 +3,29 @@
 #include <stdlib.h>
 #include <pgm/pgm.h>
 
-#define GSI_STR             "pFTP Server GSI 1"
-#define GSI_STR_LEN         17
-
 void print_usage() {
-    fprintf(stderr, "PFTP Server v0.0.1 by Maarten Vergouwe,\n"
+    fprintf(stderr, "PFTP Client v0.0.1 by Maarten Vergouwe,\n"
             "Copyright Televic NV\n"
             "\n"
             "Usage : \n"
             "pftp [OPTIONS] file-to-send \n"
-            "\n"
-            "OPTIONS:\n"
-            "\t-n multicast-address\t\tSelect multicast address to send on.\n"
-            "\t-p destination port\t\tSelect port to send to.\n");
+            "\tOPTIONS:\n"
+            "\t\t-n multicast-address\t\tSelect multicast address to receive on.\n");
     exit(-1);
 }
 
 int main( int argc, char *argv[]) {
     int c = 0;
-    int port = 0;
+    int port = 8080;
     char *network = NULL;
     pgm_error_t* pgm_err = NULL;
     pgm_sock_t *pgm_sock;
 
-    while((c = getopt(argc, argv, "hn:p:") != -1)) {
+    while((c = getopt(argc, argv, "n:") != -1)) {
         switch (c) {
         case 'n':
             network = optarg;
             break;
-        case 'p':
-            port = atoi(optarg);
-            break;
-        case 'h':
         case '?':
             print_usage();
             break;
@@ -43,7 +34,7 @@ int main( int argc, char *argv[]) {
             break;
         }
     }
-    
+
     /* Initialize PGM */
     if (!pgm_init( &pgm_err )) {
         fprintf( stderr, "PGM init err: %s\n", pgm_err->message );
@@ -94,8 +85,8 @@ int main( int argc, char *argv[]) {
     struct pgm_sockaddr_t addr;
     memset (&addr, 0, sizeof(addr));
     addr.sa_port = port ? port : DEFAULT_DATA_DESTINATION_PORT;
-    addr.sa_addr.sport = DEFAULT_DATA_SOURCE_PORT;
-    if (!pgm_gsi_create_from_string (&addr.sa_addr.gsi, GSI_STR, GSI_STR_LEN)) {
+    addr.sa_addr.sport = port ? port : DEFAULT_DATA_SOURCE_PORT;
+    if (!pgm_gsi_create_from_string (&addr.sa_addr.gsi, "pFTP Server GSI 1", 0)) {
         fprintf (stderr, "Creating GSI: invalid parameters\n");
         return -1;
     }
