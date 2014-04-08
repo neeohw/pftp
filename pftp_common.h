@@ -8,7 +8,7 @@
 
 #define PFTP_DEFAULT_MCAST_ADDR "239.192.0.1"
 
-#define PGMBUF_SIZE             (4096)
+#define PGMBUF_SIZE             (1436)
 #define FNAMSIZE                (128)
 
 #define PFTP_UDP_PORT           (5698)

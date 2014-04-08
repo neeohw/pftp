@@ -1,12 +1,21 @@
 #include <stdio.h>
 #include <unistd.h>
+#include <errno.h>
+#include <string.h>
 #include <stdlib.h>
-#include <pgm/pgm.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include <time.h>
+#include <pthread.h>
+#include <signal.h>
 
-#define GSI_STR             "pFTP Server GSI 1"
-#define GSI_STR_LEN         17
+#include "pftp_common.h"
 
-void print_usage() {
+static int m_run_receiver = 0;
+static pthread_mutex_t m_pftp_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void print_usage() {
     fprintf(stderr, "PFTP Server v0.0.1 by Maarten Vergouwe,\n"
             "Copyright Televic NV\n"
             "\n"
@@ -14,22 +23,101 @@ void print_usage() {
             "pftp [OPTIONS] file-to-send \n"
             "\n"
             "OPTIONS:\n"
-            "\t-n multicast-address\t\tSelect multicast address to send on.\n"
+            "\t-m multicast-address\t\tSelect multicast address to send on.\n"
+            "\t-i interface\t\t\tSelect interface to send on.\n"
             "\t-p destination port\t\tSelect port to send to.\n");
     exit(-1);
 }
 
+//static void handle_sigint(int signo) {
+//    m_run_receiver = 0;
+//}
+
+static void *nak_routine(void *arg) {
+    /* This thread makes sure we get the NAKs from the receivers */
+    pgm_sock_t *pgm_sock = (pgm_sock_t*)arg;
+    pgm_error_t* pgm_err = NULL;
+
+    int fds = 0;
+    fd_set readfds;
+    char recv_buf[PGMBUF_SIZE];
+    size_t bytes_read = 0;
+
+    int run_receiver = m_run_receiver;
+    while (run_receiver) {
+        memset(&recv_buf, 0, PGMBUF_SIZE);
+        bytes_read = 0;
+        struct timeval tv;
+
+        struct pgm_sockaddr_t from;
+        socklen_t from_sz = sizeof(from);
+        const int pgm_status = pgm_recvfrom(pgm_sock, recv_buf, PGMBUF_SIZE, MSG_DONTWAIT, &bytes_read, &from, &from_sz, &pgm_err);
+
+        //PRINT_ERR("pgm_status: %d", pgm_status);
+        switch (pgm_status) {
+        case PGM_IO_STATUS_TIMER_PENDING:
+        {
+            socklen_t optlen = sizeof(tv);
+            pgm_getsockopt (pgm_sock, IPPROTO_PGM, PGM_TIME_REMAIN, &tv, &optlen);
+            if (0 == (tv.tv_sec * 1000) + ((tv.tv_usec + 500) / 1000))
+                break;
+            goto block;
+        }
+        case PGM_IO_STATUS_RATE_LIMITED:
+        {
+            socklen_t optlen = sizeof(tv);
+            pgm_getsockopt (pgm_sock, IPPROTO_PGM, PGM_RATE_REMAIN, &tv, &optlen);
+            if (0 == (tv.tv_sec * 1000) + ((tv.tv_usec + 500) / 1000))
+                break;
+            /* No accidental fallthrough! */
+        }
+block:
+        case PGM_IO_STATUS_WOULD_BLOCK:
+            FD_ZERO(&readfds);
+            pgm_select_info(pgm_sock, &readfds, NULL, &fds);
+            fds = select(fds, &readfds, NULL, NULL, pgm_status == PGM_IO_STATUS_WOULD_BLOCK ? NULL : &tv);
+            break;
+        default :
+            if (pgm_err) {
+                fprintf(stderr, "%s\n", pgm_err->message);
+                pgm_error_free(pgm_err);
+                pgm_err = NULL;
+            }
+            break;
+        }
+        pthread_mutex_lock(&m_pftp_mutex);
+        run_receiver = m_run_receiver;
+        pthread_mutex_unlock(&m_pftp_mutex);
+    }
+    pthread_exit(NULL);
+}
+
 int main( int argc, char *argv[]) {
     int c = 0;
+    int ret_val = 0;
     int port = 0;
-    char *network = NULL;
+    char network[128];
+    char *file = NULL;
+    char *iface = NULL;
+    char *mcast_addr = NULL;
+    int bfd = 0;
+    network[0] = '\0';
+
+#ifdef UDPTEST
+    int sockfd = 0;
+#else
     pgm_error_t* pgm_err = NULL;
     pgm_sock_t *pgm_sock;
+    pthread_t nak_thread;
+#endif
 
-    while((c = getopt(argc, argv, "hn:p:") != -1)) {
+    while((c = getopt(argc, argv, ":hm:i:p:f:")) != -1) {
         switch (c) {
-        case 'n':
-            network = optarg;
+        case 'm':
+            mcast_addr = optarg;
+            break;
+        case 'i':
+            iface = optarg;
             break;
         case 'p':
             port = atoi(optarg);
@@ -43,100 +131,190 @@ int main( int argc, char *argv[]) {
             break;
         }
     }
-    
-    /* Initialize PGM */
-    if (!pgm_init( &pgm_err )) {
-        fprintf( stderr, "PGM init err: %s\n", pgm_err->message );
-        pgm_error_free( pgm_err );
-        return -1;
+
+    if(optind != argc-1) {
+        PRINT_ERR("Please provide the path to a file you want to send!");
+        ret_val = -1;
+        goto ret_error;
+    } else {
+        file = argv[optind];
     }
 
-    /* Get address information from IP addresss */
-    struct pgm_addrinfo_t *pgm_addrinfo = NULL;
-    if (!pgm_getaddrinfo( "239.136.4.1", NULL, &pgm_addrinfo, &pgm_err )) {
-        fprintf( stderr, "Couldn't get address info: %s\n", pgm_err->message );
-        pgm_error_free( pgm_err );
-        return -1;
+    if (iface) {
+        char *ifaddr = pftp_inet_iftoa(iface);
+        if (strlen(ifaddr) > 0) {
+            strncat(network, ifaddr, 128);
+            strncat(network, ";", 128);
+        }
     }
 
-    /* Create PGM socket */
-    if (!pgm_socket( &pgm_sock, pgm_addrinfo->ai_send_addrs[0].gsr_group.ss_family,
-                    SOCK_SEQPACKET, IPPROTO_PGM, &pgm_err)) {
-        fprintf( stderr, "Create socket error: %s\n", pgm_err->message );
-        pgm_error_free( pgm_err );
-        return -1;
+    if (mcast_addr) {
+        strncat(network, mcast_addr, 128);
+    } else {
+        strncat(network, PFTP_DEFAULT_MCAST_ADDR, 128);
     }
 
-    /* Set session parameters */
-    const int send_only       = 1,
-              ambient_spm     = pgm_secs (30),
-              heartbeat_spm[] = { pgm_msecs (100),
-                                  pgm_msecs (100),
-                                  pgm_msecs (100),
-                                  pgm_msecs (100),
-                                  pgm_msecs (1300),
-                                  pgm_secs  (7),
-                                  pgm_secs  (16),
-                                  pgm_secs  (25),
-                                  pgm_secs  (30) },
-              max_tpdu        = 1500,
-              max_rte         = 400*1000,
-              sqns            = 100;
+#ifdef UDPTEST
+    struct sockaddr_in servaddr;
 
-    pgm_setsockopt (pgm_sock, IPPROTO_PGM, PGM_SEND_ONLY, &send_only, sizeof(send_only));
-    pgm_setsockopt (pgm_sock, IPPROTO_PGM, PGM_MTU, &max_tpdu, sizeof(max_tpdu));
-    pgm_setsockopt (pgm_sock, IPPROTO_PGM, PGM_TXW_SQNS, &sqns, sizeof(sqns));
-    pgm_setsockopt (pgm_sock, IPPROTO_PGM, PGM_TXW_MAX_RTE, &max_rte, sizeof(max_rte));
-    pgm_setsockopt (pgm_sock, IPPROTO_PGM, PGM_AMBIENT_SPM, &ambient_spm, sizeof(ambient_spm));
-    pgm_setsockopt (pgm_sock, IPPROTO_PGM, PGM_HEARTBEAT_SPM, &heartbeat_spm, sizeof(heartbeat_spm));
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    memset(&servaddr, 0, sizeof(servaddr));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_addr.s_addr = inet_addr(PFTP_DEFAULT_MCAST_ADDR);
+    servaddr.sin_port = port ? htons(port) : htons(PFTP_UDP_PORT);
+#else
 
-    /* Create Global Session Identifier */
-    struct pgm_sockaddr_t addr;
-    memset (&addr, 0, sizeof(addr));
-    addr.sa_port = port ? port : DEFAULT_DATA_DESTINATION_PORT;
-    addr.sa_addr.sport = DEFAULT_DATA_SOURCE_PORT;
-    if (!pgm_gsi_create_from_string (&addr.sa_addr.gsi, GSI_STR, GSI_STR_LEN)) {
-        fprintf (stderr, "Creating GSI: invalid parameters\n");
-        return -1;
+    if (0 != pftp_create(1, network, port, &pgm_sock)) {
+        ret_val = -1;
+        goto ret_error;
     }
 
-    /* Bind socket to specified address */
-    struct pgm_interface_req_t if_req;
-    memset (&if_req, 0, sizeof(if_req));
-    if_req.ir_interface = pgm_addrinfo->ai_recv_addrs[0].gsr_interface;
-    if_req.ir_scope_id  = 0;
-    if (AF_INET6 == pgm_addrinfo->ai_send_addrs[0].gsr_group.ss_family) {
-        struct sockaddr_in6 sa6;
-        memcpy (&sa6, &pgm_addrinfo->ai_recv_addrs[0].gsr_group, sizeof(sa6));
-        if_req.ir_scope_id = sa6.sin6_scope_id;
-    }
-    if (!pgm_bind3 (pgm_sock,
-            &addr, sizeof(addr),
-            &if_req, sizeof(if_req),	/* tx interface */
-            &if_req, sizeof(if_req),	/* rx interface */
-            &pgm_err))
-    {
-        fprintf (stderr, "Binding PGM socket: %s\n", pgm_err->message);
-        return -1;
+    int pgm_status;
+
+    /* Start NAK receiver thread */
+    m_run_receiver = 1;
+    pthread_create(&nak_thread, NULL, nak_routine, (void*)pgm_sock);
+#endif
+
+    char buf[PGMBUF_SIZE];
+    buf[0] = '\0';
+
+    struct stat fstat;
+    if (-1 == stat(file, &fstat)) {
+        PRINT_ERR("Couldn't stat file: %s", strerror(errno));
+        ret_val = -1;
+        goto ret_error;
     }
 
-    const int blocking = 0,
-          multicast_loop = 0,
-          multicast_hops = 16,
-          dscp = 0x2e << 2;		/* Expedited Forwarding PHB for network elements, no ECN. */
-
-    pgm_setsockopt (pgm_sock, IPPROTO_PGM, PGM_MULTICAST_LOOP, &multicast_loop, sizeof(multicast_loop));
-    pgm_setsockopt (pgm_sock, IPPROTO_PGM, PGM_MULTICAST_HOPS, &multicast_hops, sizeof(multicast_hops));
-    if (AF_INET6 != pgm_addrinfo->ai_send_addrs[0].gsr_group.ss_family) {
-        pgm_setsockopt (pgm_sock, IPPROTO_PGM, PGM_TOS, &dscp, sizeof(dscp));
-    }
-    pgm_setsockopt (pgm_sock, IPPROTO_PGM, PGM_NOBLOCK, &blocking, sizeof(blocking));
-
-    if (!pgm_connect (pgm_sock, &pgm_err)) {
-        fprintf (stderr, "Connecting PGM socket: %s\n", pgm_err->message);
-        return -1;
+    char *fname = strrchr(file, '/');
+    if (!fname) {
+        fname = file;
+    } else {
+        fname = fname+1;
     }
 
+    memset(buf, 0, PGMBUF_SIZE);
+    snprintf(buf, PGMBUF_SIZE, CMD_SEND_FILE" %ld %s", fstat.st_size, fname);
+    PRINT_DBG("Sending file with command: %s", buf);
 
-    return 0;
+    size_t bytes_written;
+    int bytes_read;
+
+#ifdef UDPTEST
+    bytes_written = sendto(sockfd, buf, strlen(buf)+1, 0, (struct sockaddr*)&servaddr, sizeof(servaddr));
+    if (bytes_written != strlen(buf)+1) {
+        PRINT_ERR("Couldn't send file transfer command! %s", strerror(errno));
+        ret_val = -1;
+        goto ret_error;
+    }
+#else
+    pgm_status = pgm_status = pgm_send(pgm_sock, buf, strlen(buf)+1, &bytes_written);
+    if (pgm_status != PGM_IO_STATUS_NORMAL) {
+        PRINT_ERR("Couldn't send file transfer command!");
+        ret_val = -1;
+        goto ret_error;
+    }
+#endif
+
+    bfd = open(file, O_RDONLY);
+    if (bfd < 0) {
+        PRINT_ERR("Couldn't open file for reading! %s", strerror(errno));
+        ret_val = -1;
+        goto ret_error;
+    }
+
+    int fds = 0;
+    fd_set writefds;
+    fd_set readfds;
+
+    bytes_read = read(bfd, buf, PGMBUF_SIZE);
+    while (bytes_read > 0) {
+
+#ifdef UDPTEST
+
+        bytes_written = sendto(sockfd, buf, bytes_read, 0, (struct sockaddr*)&servaddr, sizeof(servaddr));
+
+#else
+        struct timeval tv;
+        pgm_status = pgm_send(pgm_sock, buf, bytes_read, &bytes_written);
+
+        //PRINT_DBG("pgm_status: %d", pgm_status);
+
+        switch (pgm_status) {
+
+        case PGM_IO_STATUS_NORMAL :
+        {
+#endif
+            if (bytes_written != bytes_read) {
+                PRINT_ERR("Error sending file!");
+                ret_val = -1;
+                goto ret_error;
+            }
+            bytes_read = read(bfd, buf, PGMBUF_SIZE);
+
+#ifdef UDPTEST
+            struct timespec ts = {0, 35000};
+            nanosleep(&ts, NULL);
+#else
+        } break;
+        case PGM_IO_STATUS_TIMER_PENDING:
+        {
+            socklen_t optlen = sizeof(tv);
+            pgm_getsockopt (pgm_sock, IPPROTO_PGM, PGM_TIME_REMAIN, &tv, &optlen);
+            if (0 == (tv.tv_sec * 1000) + ((tv.tv_usec + 500) / 1000))
+                break;
+            goto block;
+        }
+        case PGM_IO_STATUS_RATE_LIMITED :
+        {
+            socklen_t optlen = sizeof(tv);
+            pgm_getsockopt (pgm_sock, IPPROTO_PGM, PGM_RATE_REMAIN, &tv, &optlen);
+            if (0 == (tv.tv_sec * 1000) + ((tv.tv_usec + 500) / 1000))
+                break;
+            /* No accidental fallthrough! */
+        }
+        case PGM_IO_STATUS_CONGESTION :
+        case PGM_IO_STATUS_WOULD_BLOCK :
+block:
+        {
+            FD_ZERO(&writefds);
+            pgm_select_info(pgm_sock, NULL, &writefds, &fds);
+            fds = select(fds, NULL, &writefds, NULL, pgm_status == PGM_IO_STATUS_WOULD_BLOCK ? NULL : &tv);
+        } break;
+        default:
+            PRINT_ERR("Send error!");
+            ret_val = -1;
+            goto ret_error;
+            break;
+        }
+#endif
+    }
+
+#ifndef UDPTEST
+    pthread_mutex_lock(&m_pftp_mutex);
+    m_run_receiver = 0;
+    pthread_mutex_unlock(&m_pftp_mutex);
+    pthread_join(nak_thread, NULL);
+    pthread_mutex_destroy(&m_pftp_mutex);
+#endif
+
+    goto ret_good;
+
+ret_error:
+    PRINT_DBG("Exit error");
+    goto ret;
+ret_good:
+    PRINT_DBG("Exit good");
+ret:
+    if (bfd > 0)
+        close(bfd);
+#ifdef UDPTEST
+    if (sockfd > 0)
+        close(sockfd);
+#else
+    if (pgm_sock) {
+        pftp_stop(pgm_sock);
+    }
+#endif
+    return ret_val;
 }

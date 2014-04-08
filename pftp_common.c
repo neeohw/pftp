@@ -9,6 +9,9 @@
 #include <string.h>
 
 int pftp_create(const int sender, const char* network, const int port, pgm_sock_t **pgm_sock) {
+    pgm_log_mask = 0xfff;
+    pgm_min_log_level = PGM_LOG_LEVEL_DEBUG;
+
     int ret_val = 0;
     char gsistr[20];
     gsistr[0] = '\0';
@@ -36,6 +39,7 @@ int pftp_create(const int sender, const char* network, const int port, pgm_sock_
     /* Create PGM socket */
     PRINT_DBG("Creating PGM socket");
     if (!pgm_socket( pgm_sock, sa_family, SOCK_SEQPACKET, IPPROTO_PGM, &pgm_err)) {
+//    if (!pgm_socket( pgm_sock, sa_family, SOCK_SEQPACKET, IPPROTO_UDP, &pgm_err)) {
         PRINT_ERR("Create socket error: %s", pgm_err->message );
         ret_val = -3;
         goto ret_error;
@@ -55,8 +59,8 @@ int pftp_create(const int sender, const char* network, const int port, pgm_sock_
                                       pgm_secs  (25),
                                       pgm_secs  (30) },
                   max_tpdu        = 1500,
-                  max_rte         = 400*1000,
-                  sqns            = 100;
+                  max_rte         = 8000000,
+                  sqns            = 1500;
 
         pgm_setsockopt (*pgm_sock, IPPROTO_PGM, PGM_SEND_ONLY, &send_only, sizeof(send_only));
         pgm_setsockopt (*pgm_sock, IPPROTO_PGM, PGM_MTU, &max_tpdu, sizeof(max_tpdu));
@@ -72,13 +76,13 @@ int pftp_create(const int sender, const char* network, const int port, pgm_sock_
                 passive = 0,
                 peer_expiry = pgm_secs (300),
                 spmr_expiry = pgm_msecs (250),
-                nak_bo_ivl = pgm_msecs (50),
-                nak_rpt_ivl = pgm_secs (2),
-                nak_rdata_ivl = pgm_secs (2),
+                nak_bo_ivl = pgm_msecs (20),
+                nak_rpt_ivl = pgm_msecs (200),
+                nak_rdata_ivl = pgm_msecs (200),
                 nak_data_retries = 50,
                 nak_ncf_retries = 50,
                 max_tpdu        = 1500,
-                sqns = 100;
+                sqns = 1500;
 
         pgm_setsockopt (*pgm_sock, IPPROTO_PGM, PGM_RECV_ONLY, &recv_only, sizeof(recv_only));
         pgm_setsockopt (*pgm_sock, IPPROTO_PGM, PGM_PASSIVE, &passive, sizeof(passive));
@@ -95,6 +99,16 @@ int pftp_create(const int sender, const char* network, const int port, pgm_sock_
         strncat(gsistr, "pFTP Client GSI", 15);
     }
 
+//    const int udpport = PFTP_UDP_PORT;
+//    pgm_setsockopt (*pgm_sock, IPPROTO_PGM, PGM_UDP_ENCAP_MCAST_PORT, &udpport, sizeof(udpport));
+//    pgm_setsockopt (*pgm_sock, IPPROTO_PGM, PGM_UDP_ENCAP_UCAST_PORT, &udpport, sizeof(udpport));
+
+    struct pgm_pgmccinfo_t pgmccinfo = {
+        pgm_msecs (50),
+                   75,
+                   1000 };
+    pgm_setsockopt(*pgm_sock, IPPROTO_PGM, PGM_USE_PGMCC, &pgmccinfo, sizeof(pgmccinfo));
+
     /* Create Global Session Identifier */
     PRINT_DBG("Creating PGM GSI");
     struct pgm_sockaddr_t addr;
@@ -106,12 +120,6 @@ int pftp_create(const int sender, const char* network, const int port, pgm_sock_
         ret_val = -4;
         goto ret_error;
     }
-
-    /* join IP multicast groups */
-    unsigned int i=0;
-    for (; i < pgm_addrinfo->ai_recv_addrs_len; i++)
-        pgm_setsockopt(*pgm_sock, IPPROTO_PGM, PGM_JOIN_GROUP, &pgm_addrinfo->ai_recv_addrs[i], sizeof(struct group_req));
-    pgm_setsockopt(*pgm_sock, IPPROTO_PGM, PGM_SEND_GROUP, &pgm_addrinfo->ai_send_addrs[0], sizeof(struct group_req));
 
     /* Bind socket to specified address */
     struct pgm_interface_req_t if_req;
@@ -135,8 +143,14 @@ int pftp_create(const int sender, const char* network, const int port, pgm_sock_
         goto ret_error;
     }
 
-    const int nonblocking = 0,
-          multicast_loop = 1,
+    /* join IP multicast groups */
+    unsigned int i=0;
+    for (; i < pgm_addrinfo->ai_recv_addrs_len; i++)
+        pgm_setsockopt(*pgm_sock, IPPROTO_PGM, PGM_JOIN_GROUP, &pgm_addrinfo->ai_recv_addrs[i], sizeof(struct group_req));
+    pgm_setsockopt(*pgm_sock, IPPROTO_PGM, PGM_SEND_GROUP, &pgm_addrinfo->ai_send_addrs[0], sizeof(struct group_req));
+
+    const int nonblocking = 1,
+          multicast_loop = 0,
           multicast_hops = 16,
           dscp = 0x2e << 2;		/* Expedited Forwarding PHB for naddr elements, no ECN. */
 
